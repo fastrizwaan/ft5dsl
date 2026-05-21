@@ -35,6 +35,8 @@ from pathlib import Path
 from typing import Iterator
 
 import gi
+# Hardware Acclerated Rendering (0); Software Rendering (1)
+os.environ['WEBKIT_DISABLE_COMPOSITING_MODE'] = '1'
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -116,7 +118,7 @@ class ResourceResolver:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # cache: (dict_dir, filename) → uri | None
+        # cache: (dict_path_str, filename) → uri | None
         self._cache: OrderedDict[tuple[str, str], str | None] = OrderedDict()
         self._cache_max = 4096
 
@@ -124,7 +126,7 @@ class ResourceResolver:
         """Return a file:// URI for *filename* relative to *dict_path*, or None."""
         if not filename:
             return None
-        key = (str(dict_path.parent), filename)
+        key = (str(dict_path.resolve()), filename)
         with self._lock:
             if key in self._cache:
                 self._cache.move_to_end(key)
@@ -157,9 +159,10 @@ class ResourceResolver:
         return None
 
     def invalidate(self, dict_path: Path) -> None:
-        prefix = str(dict_path.parent)
+        """Drop all cached entries for this specific dictionary path."""
+        path_str = str(dict_path.resolve())
         with self._lock:
-            stale = [k for k in self._cache if k[0] == prefix]
+            stale = [k for k in self._cache if k[0] == path_str]
             for k in stale:
                 del self._cache[k]
 
@@ -983,6 +986,10 @@ class FT5Database:
             return []
 
         unique: dict[str, dict] = {}
+        # Scan at most this many rows per dictionary to keep cost bounded.
+        # With many dicts this could still add up; a future trigram index
+        # (spellfix1 / FTS prefix) would scale better.
+        per_dict_scan = 1000
 
         for row in self.get_dictionaries():
             if not row["enabled"]:
@@ -996,9 +1003,9 @@ class FT5Database:
                     SELECT DISTINCT headword, normalized_headword
                     FROM entries
                     WHERE normalized_headword >= ? AND normalized_headword < ?
-                    LIMIT 2000
+                    LIMIT ?
                     """,
-                    (prefix_2, prefix_2 + "\uffff"),
+                    (prefix_2, prefix_2 + "\uffff", per_dict_scan),
                 )
                 for r in cur.fetchall():
                     cand_norm = r["normalized_headword"]
@@ -1014,6 +1021,9 @@ class FT5Database:
                             "dict_id": row["id"],
                             "db_path": row["db_path"],
                         }
+                    # Early exit: if we have enough high-quality hits, stop scanning
+                    if len(unique) >= limit * 3:
+                        break
             except sqlite3.Error as e:
                 print(f"[search_fuzzy] {row['name']}: {e}")
 
@@ -1299,6 +1309,79 @@ hr {
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  HTML sanitizer — whitelist-based, applied to all dictionary article content
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Tags that are completely removed along with their content
+_SANITIZE_BLOCK_TAGS = re.compile(
+    r"<(script|style|iframe|object|embed|form|base|link|meta|svg|math)"
+    r"(?:\s[^>]*)?>.*?</\1>|"
+    r"<(script|style|iframe|object|embed|form|base|link|meta|svg|math)"
+    r"(?:\s[^>]*)?/?>",
+    re.S | re.I,
+)
+
+# Any remaining open/close tag not in our allowed set → stripped (tag only, content kept)
+_ALLOWED_TAGS = frozenset(
+    "a abbr b strong i em u sub sup span div br hr p h1 h2 h3 h4 "
+    "ul ol li dl dt dd blockquote pre code img audio source table "
+    "thead tbody tr th td".split()
+)
+
+# Attributes unconditionally forbidden on any element
+_FORBIDDEN_ATTRS = re.compile(
+    r"""\s+(?:on\w+|style|formaction|action|data|srcdoc|xlink:\w+)"""
+    r"""(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*))?""",
+    re.I,
+)
+
+# Tag stripper for non-allowed tags (keeps inner text)
+_ANY_TAG = re.compile(r"<(/?)(\w+)([^>]*)>", re.S)
+
+
+def _sanitize_article(html: str) -> str:
+    """Sanitize dictionary HTML using a whitelist approach.
+
+    Steps:
+    1. Completely remove block-dangerous tags and their content.
+    2. Strip event-handler and dangerous attributes from all remaining tags.
+    3. Remove entire tags (not content) for anything outside the allowed set.
+    """
+    # Step 1: nuke blocked elements entirely (with content)
+    html = _SANITIZE_BLOCK_TAGS.sub("", html)
+
+    # Step 2 & 3: walk every remaining tag
+    def _clean_tag(m: re.Match) -> str:
+        slash = m.group(1)       # "/" for closing tags
+        tag = m.group(2).lower()
+        attrs = m.group(3)
+
+        if tag not in _ALLOWED_TAGS:
+            return ""            # strip the tag; caller keeps text content
+
+        # Strip forbidden attributes
+        attrs = _FORBIDDEN_ATTRS.sub("", attrs)
+
+        # Ensure <a> tags only allow safe href schemes
+        if tag == "a":
+            attrs = re.sub(
+                r"""(href\s*=\s*)(['"])((?!https?://|lookup:|file://)[^'"]*)\2""",
+                r'\1\2#\2',
+                attrs,
+                flags=re.I,
+            )
+
+        # Self-closing for void elements
+        void = tag in ("br", "hr", "img", "source")
+        if void:
+            return f"<{tag}{attrs}>"
+        return f"<{slash}{tag}{attrs}>"
+
+    html = _ANY_TAG.sub(_clean_tag, html)
+    return html
+
+
 def build_article_html(results: list[dict]) -> str:
     if not results:
         return build_message_html("No results.")
@@ -1312,10 +1395,7 @@ def build_article_html(results: list[dict]) -> str:
     ]
 
     for res in results:
-        article = res["article"]
-        # Strip dangerous tags
-        article = re.sub(r"<style[^>]*>.*?</style>", "", article, flags=re.S)
-        article = re.sub(r"<script[^>]*>.*?</script>", "", article, flags=re.S)
+        article = _sanitize_article(res["article"])
         parts.append(
             f"<section class='entry-card'>"
             f"<div class='dict-name'>{_esc(res['dict_name'])}</div>"
@@ -1342,7 +1422,27 @@ def build_message_html(message: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  GObject model for results column view
+#  Trusted WebView shell page
+#
+#  Loaded once.  All dictionary content is injected into #content via
+#  window._updateContent(html) — a function installed by a UserScript.
+#  JS from dictionary articles never executes here because:
+#    1. _sanitize_article() has already stripped all script/event content.
+#    2. Content arrives via innerHTML into a sandboxed div, not as a new page.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SHELL_HTML = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'>
+<meta name='color-scheme' content='light dark'>
+<style>{ARTICLE_CSS}</style>
+</head>
+<body>
+<div id='content'><p style='color:var(--muted)'>Type a word to search.</p></div>
+</body>
+</html>
+"""
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ResultItem(GObject.Object):
@@ -1458,6 +1558,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._index_lock = threading.Lock()
         self._current_headword: str | None = None
         self._current_dict_id: int | None = None
+        self._webview_shell_loaded = False
+        self._webview_pending_html: str | None = None
 
         # ── lookup worker ────────────────────────────────────────────────────
         self._lookup_queue = queue.Queue()
@@ -1594,15 +1696,41 @@ class MainWindow(Adw.ApplicationWindow):
         ctx = WebKit.WebContext.get_default()
         ctx.set_cache_model(WebKit.CacheModel.DOCUMENT_VIEWER)
 
-        self.webview = WebKit.WebView()
+        # Trusted shell page: JS is enabled here but dictionary content is
+        # injected as sanitized text into a sandboxed <div> — never as a
+        # script.  We use a UserScript that exposes _updateContent(html) so
+        # the Python side can call it via evaluate_javascript without enabling
+        # JS globally for dictionary articles.
+        ucm = WebKit.UserContentManager()
+        shell_script = WebKit.UserScript(
+            # Expose a single safe update function in the shell page's scope.
+            # Dictionary HTML arrives as a pre-sanitized string and is written
+            # via textContent-safe innerHTML into a known container.
+            """
+            window._updateContent = function(safeHtml) {
+                var el = document.getElementById('content');
+                if (el) {
+                    el.innerHTML = safeHtml;
+                    window.scrollTo(0, 0);
+                }
+            };
+            """,
+            WebKit.UserContentInjectedFrames.ALL_FRAMES,
+            WebKit.UserScriptInjectionTime.END,
+            None, None,
+        )
+        ucm.add_script(shell_script)
+
+        self.webview = WebKit.WebView(user_content_manager=ucm)
         self.webview.set_vexpand(True)
-        nav_policy = self.webview.get_settings()
-        # JS required for snapshot (innerHTML replace) rendering
-        nav_policy.set_enable_javascript(True)
-        nav_policy.set_enable_page_cache(True)
-        nav_policy.set_enable_back_forward_navigation_gestures(False)
+        wv_settings = self.webview.get_settings()
+        # JS is needed only for our own _updateContent call; dictionary
+        # content itself is sanitized before insertion and cannot run scripts.
+        wv_settings.set_enable_javascript(True)
+        wv_settings.set_enable_page_cache(False)
+        wv_settings.set_enable_back_forward_navigation_gestures(False)
         self.webview.connect("decide-policy", self._on_nav_policy)
-        self._webview_ready = False   # True once initial page has loaded
+        self._webview_shell_loaded = False
         self.webview.connect("load-changed", self._on_webview_load_changed)
 
         art_toolbar.set_content(self.webview)
@@ -1621,6 +1749,11 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Start background indexing
         self._index_async()
+
+        # Load the trusted shell page once — all subsequent content updates
+        # go through _inject_content() without reloading the page.
+        base_uri = GLib.filename_to_uri(str(DATA_DIR), None)
+        self.webview.load_html(_SHELL_HTML, base_uri)
 
         # File monitor for auto-reindex on changes
         self._monitor = Gio.File.new_for_path(str(DATA_DIR)).monitor_directory(
@@ -1879,28 +2012,29 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_webview_load_changed(self, wv, event):
         if event == WebKit.LoadEvent.FINISHED:
-            self._webview_ready = True
+            self._webview_shell_loaded = True
+            # Flush any content that queued before the shell finished loading
+            pending = self._webview_pending_html
+            if pending is not None:
+                self._webview_pending_html = None
+                self._inject_content(pending)
 
     def _show_html(self, html: str):
-        base_uri = GLib.filename_to_uri(str(DATA_DIR), None)
-        if self._webview_ready:
-            # Snapshot render: replace body content without a full page reload.
-            # Extract the <body> content from the new HTML and swap it in via JS,
-            # preserving scroll position reset.
-            body_match = re.search(r"<body[^>]*>(.*)</body>", html, re.S)
-            if body_match:
-                body_content = body_match.group(1)
-                # JSON-encode the content so it survives JS string embedding
-                import json
-                js = (
-                    "document.body.innerHTML = " + json.dumps(body_content) + ";"
-                    "window.scrollTo(0,0);"
-                )
-                self.webview.evaluate_javascript(js, -1, None, None, None, None, None)
-                return
-        # First load or fallback: full page load
-        self._webview_ready = False
-        self.webview.load_html(html, base_uri)
+        """Display article HTML in the WebView via the shell page."""
+        body_match = re.search(r"<body[^>]*>(.*)</body>", html, re.S)
+        body_html = body_match.group(1) if body_match else html
+
+        if not self._webview_shell_loaded:
+            # Shell still loading (e.g. a lookup fired during startup)
+            self._webview_pending_html = body_html
+        else:
+            self._inject_content(body_html)
+
+    def _inject_content(self, body_html: str) -> None:
+        """Inject sanitized body HTML into the shell page's #content div."""
+        import json
+        js = f"window._updateContent({json.dumps(body_html)});"
+        self.webview.evaluate_javascript(js, -1, None, None, None, None, None)
 
     def _on_nav_policy(self, wv, decision, decision_type):
         if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
