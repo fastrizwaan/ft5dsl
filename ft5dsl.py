@@ -18,7 +18,9 @@ Features
 
 from __future__ import annotations
 
+import functools
 import gzip
+import hashlib
 import mmap
 import os
 import queue
@@ -55,6 +57,8 @@ LIBRARY_DB = CACHE_DIR / "library.db"
 MAX_OPEN_MMAPS = 64
 MAX_OPEN_READER_CONNS = 24
 SEARCH_DEBOUNCE_MS = 500
+HTML_CACHE_SIZE = 512       # rendered article cache entries
+FUZZY_MAX_DISTANCE = 2      # max edit distance for trigram fuzzy search
 
 for _d in (DATA_DIR, CACHE_DIR, INDEX_DIR):
     _d.mkdir(parents=True, exist_ok=True)
@@ -90,12 +94,77 @@ _RX_REF = re.compile(r"\[ref\](.*?)\[/ref\]|\<\<(.*?)\>\>", re.S)
 _RX_URL = re.compile(r"\[url(?:=(.*?))?\](.*?)\[/url\]", re.S)
 # Image  [s]filename[/s]
 _RX_IMG = re.compile(r"\[s\](.*?)\[/s\]", re.S)
-# Sound  [snd]filename[/snd]  (skip)
+# Sound  [snd]filename[/snd]  → <audio> element
 _RX_SND = re.compile(r"\[snd\](.*?)\[/snd\]", re.S)
 # Margin / indent level  [m1]…[/m1]
 _RX_MN = re.compile(r"\[m(\d?)\](.*?)\[/m\1\]", re.S)
 # Generic inline open/close  (leftover unknown tags)
 _RX_TAG = re.compile(r"\[/?\w[\w\d]*[^\]]*\]")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Resource Resolver — maps bare filenames to real filesystem paths
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RESOURCE_SUBDIRS = ("", "res", "sound", "img", "files", "media", "audio")
+
+class ResourceResolver:
+    """Resolves DSL resource filenames (images, audio) to file:// URIs.
+
+    Searches <dict_stem>.files/, res/, img/, sound/, media/ alongside the
+    dictionary file, then DATA_DIR itself.  Results are LRU-cached.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # cache: (dict_dir, filename) → uri | None
+        self._cache: OrderedDict[tuple[str, str], str | None] = OrderedDict()
+        self._cache_max = 4096
+
+    def resolve(self, filename: str, dict_path: Path) -> str | None:
+        """Return a file:// URI for *filename* relative to *dict_path*, or None."""
+        if not filename:
+            return None
+        key = (str(dict_path.parent), filename)
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+
+        result = self._search(filename, dict_path)
+        with self._lock:
+            self._cache[key] = result
+            if len(self._cache) > self._cache_max:
+                self._cache.popitem(last=False)
+        return result
+
+    def _search(self, filename: str, dict_path: Path) -> str | None:
+        stem = dict_path.stem
+        # Strip .dsl suffix that may be part of stem for .dsl.dz files
+        if stem.endswith(".dsl"):
+            stem = stem[:-4]
+        base_dir = dict_path.parent
+        search_roots = [
+            base_dir / f"{stem}.files",
+            base_dir / f"{stem}.Files",
+            DATA_DIR,
+            base_dir,
+        ]
+        for root in search_roots:
+            for sub in _RESOURCE_SUBDIRS:
+                candidate = root / sub / filename if sub else root / filename
+                if candidate.exists():
+                    return GLib.filename_to_uri(str(candidate), None)
+        return None
+
+    def invalidate(self, dict_path: Path) -> None:
+        prefix = str(dict_path.parent)
+        with self._lock:
+            stale = [k for k in self._cache if k[0] == prefix]
+            for k in stale:
+                del self._cache[k]
+
+
+_resource_resolver = ResourceResolver()
 
 
 def _esc(text: str) -> str:
@@ -107,26 +176,39 @@ def _esc(text: str) -> str:
     )
 
 
-def dsl_to_html(raw: str) -> str:
+def dsl_to_html(raw: str, dict_path: Path | None = None) -> str:
     """Convert DSL markup to an HTML fragment."""
     # Work line by line; blank lines → paragraph breaks
     lines = raw.split("\n")
     html_parts: list[str] = []
 
     for line in lines:
-        line = _convert_dsl_line(line.lstrip())
+        line = _convert_dsl_line(line.lstrip(), dict_path=dict_path)
         html_parts.append(line)
 
     return "<br>".join(html_parts)
 
 
-def _convert_dsl_line(line: str) -> str:
+def _convert_dsl_line(line: str, dict_path: Path | None = None) -> str:
     """Apply all DSL → HTML substitutions to a single line."""
     # Escape the line at the very beginning to be safe
     line = _esc(line)
 
-    # Sound tags → remove entirely
-    line = _RX_SND.sub("", line)
+    # Sound tags → <audio> player (or stripped if no path available)
+    def _snd(m: re.Match) -> str:
+        fname = m.group(1).strip()
+        uri = _resource_resolver.resolve(fname, dict_path) if dict_path else None
+        if uri:
+            return (
+                f'<audio controls class="snd-player">'
+                f'<source src="{uri}">'
+                f'<a href="{uri}">\U0001F50A {_esc(fname)}</a>'
+                f'</audio>'
+            )
+        # No file found — render as a small muted label so the markup is visible
+        return f'<span class="snd-missing" title="{_esc(fname)}">\U0001F50A</span>'
+
+    line = _RX_SND.sub(_snd, line)
 
     # Transcription
     line = _RX_TRNS.sub(lambda m: f'<span class="trns">[{m.group(1)}]</span>', line)
@@ -163,8 +245,14 @@ def _convert_dsl_line(line: str) -> str:
 
     line = _RX_URL.sub(_url, line)
 
-    # Image
-    line = _RX_IMG.sub(lambda m: f'<img src="{m.group(1)}" alt="">', line)
+    # Image — use resolved URI when possible, fall back to bare filename
+    def _img(m: re.Match) -> str:
+        fname = m.group(1).strip()
+        uri = _resource_resolver.resolve(fname, dict_path) if dict_path else None
+        src = uri if uri else _esc(fname)
+        return f'<img src="{src}" alt="">'
+
+    line = _RX_IMG.sub(_img, line)
 
     # Margin / indent
     def _margin(m: re.Match) -> str:
@@ -474,6 +562,44 @@ def _normalize(text: str) -> str:
     return unicodedata.normalize("NFKC", text).casefold().strip()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Trigram helpers + domain-aware ranking
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _trigrams(s: str) -> set[str]:
+    """Return the set of character trigrams for *s* (padded with spaces)."""
+    if not s:
+        return set()
+    padded = f"  {s} "
+    return {padded[i:i+3] for i in range(len(padded) - 2)}
+
+
+def _trigram_similarity(a: set[str], b: set[str]) -> float:
+    """Dice coefficient between two trigram sets."""
+    if not a or not b:
+        return 0.0
+    return 2 * len(a & b) / (len(a) + len(b))
+
+
+def _prefix_rank(headword: str, query: str) -> float:
+    """Domain-aware rank score for prefix search results.
+
+    Higher is better.  Scoring buckets:
+      exact match            +1000
+      prefix match (shorter) +500 − len(headword)
+      shorter words          +100 / len(headword)
+      fallback               0
+    """
+    hw_cf = headword.casefold()
+    q_cf = query.casefold()
+    if hw_cf == q_cf:
+        return 1000.0
+    if hw_cf.startswith(q_cf):
+        # Prefer shorter completions
+        return 500.0 - len(headword)
+    return 100.0 / max(len(headword), 1)
+
+
 def _open_reader(db_path: str) -> sqlite3.Connection:
     """Open a read-only WAL-compatible connection. Create one per thread."""
     conn = sqlite3.connect(db_path, timeout=10.0, check_same_thread=False)
@@ -538,6 +664,9 @@ class FT5Database:
                 self._lib.commit()
                 self.mmap_manager.close_path(Path(path))
                 self._close_reader_path(db_path)
+                # Invalidate rendered HTML and resource caches for this dict
+                html_cache_invalidate_dict(Path(path))
+                _resource_resolver.invalidate(Path(path))
                 try:
                     Path(db_path).unlink(missing_ok=True)
                 except OSError:
@@ -827,7 +956,7 @@ class FT5Database:
                 for r in cur.fetchall():
                     rec = {
                         "headword": r[0],
-                        "rank": 0.0,
+                        "rank": _prefix_rank(r[0], query),
                         "dict_name": row["name"],
                         "dict_id": row["id"],
                         "db_path": row["db_path"],
@@ -839,12 +968,57 @@ class FT5Database:
                 print(f"[search_prefix] {row['name']}: {e}")
 
         results = list(unique.values())
-        results.sort(
-            key=lambda x: (
-                x["headword"].casefold() != query.casefold(),
-                x["headword"],
-            )
-        )
+        results.sort(key=lambda x: (-x["rank"], x["headword"]))
+        return results[:limit]
+
+    def search_fuzzy(self, query: str, limit: int = 50) -> list[dict]:
+        """Trigram-based fuzzy search for approximate matches.
+
+        Ranks candidates by trigram overlap with the query.  Only used when
+        prefix search returns no results.
+        """
+        norm = _normalize(query)
+        query_trigrams = _trigrams(norm)
+        if not query_trigrams:
+            return []
+
+        unique: dict[str, dict] = {}
+
+        for row in self.get_dictionaries():
+            if not row["enabled"]:
+                continue
+            try:
+                conn = self._reader_conn(row["db_path"])
+                # Fetch a broad neighborhood using prefix on first 2 chars
+                prefix_2 = norm[:2]
+                cur = conn.execute(
+                    """
+                    SELECT DISTINCT headword, normalized_headword
+                    FROM entries
+                    WHERE normalized_headword >= ? AND normalized_headword < ?
+                    LIMIT 2000
+                    """,
+                    (prefix_2, prefix_2 + "\uffff"),
+                )
+                for r in cur.fetchall():
+                    cand_norm = r["normalized_headword"]
+                    score = _trigram_similarity(query_trigrams, _trigrams(cand_norm))
+                    if score < 0.3:
+                        continue
+                    key = r["headword"].casefold()
+                    if key not in unique or unique[key]["rank"] < score:
+                        unique[key] = {
+                            "headword": r["headword"],
+                            "rank": score,
+                            "dict_name": row["name"],
+                            "dict_id": row["id"],
+                            "db_path": row["db_path"],
+                        }
+            except sqlite3.Error as e:
+                print(f"[search_fuzzy] {row['name']}: {e}")
+
+        results = list(unique.values())
+        results.sort(key=lambda x: -x["rank"])
         return results[:limit]
 
     def search_fulltext(self, query: str, limit: int = 100) -> list[dict]:
@@ -919,9 +1093,13 @@ class FT5Database:
                     path = Path(row["path"])
                     try:
                         mm, enc = self.mmap_manager.get_mmap(path)
-                        article_bytes = mm[offset:offset+length]
-                        article_raw = article_bytes.decode(enc, errors="replace")
-                        article_html = dsl_to_html(article_raw)
+                        cache_key = (str(path), offset, length)
+                        article_html = _html_cache_get(cache_key)
+                        if article_html is None:
+                            article_bytes = mm[offset:offset+length]
+                            article_raw = article_bytes.decode(enc, errors="replace")
+                            article_html = dsl_to_html(article_raw, dict_path=path)
+                            _html_cache_put(cache_key, article_html)
                         results.append({
                             "headword": hword,
                             "article": article_html,
@@ -938,7 +1116,36 @@ class FT5Database:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CSS for WebKit article view
+#  Rendered HTML LRU cache  (avoids re-parsing DSL on repeated navigation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_html_cache_lock = threading.Lock()
+_html_cache: OrderedDict[tuple, str] = OrderedDict()
+
+
+def _html_cache_get(key: tuple) -> str | None:
+    with _html_cache_lock:
+        val = _html_cache.get(key)
+        if val is not None:
+            _html_cache.move_to_end(key)
+        return val
+
+
+def _html_cache_put(key: tuple, html: str) -> None:
+    with _html_cache_lock:
+        _html_cache[key] = html
+        _html_cache.move_to_end(key)
+        while len(_html_cache) > HTML_CACHE_SIZE:
+            _html_cache.popitem(last=False)
+
+
+def html_cache_invalidate_dict(dict_path: Path) -> None:
+    """Drop all cached entries belonging to *dict_path*."""
+    path_str = str(dict_path)
+    with _html_cache_lock:
+        stale = [k for k in _html_cache if k[0] == path_str]
+        for k in stale:
+            del _html_cache[k]
 # ─────────────────────────────────────────────────────────────────────────────
 
 ARTICLE_CSS = """
@@ -1063,6 +1270,20 @@ a { color: var(--accent); }
 .m4 { margin-left: 4.2rem; }
 
 img { max-width: 100%; border-radius: 4px; margin: 0.2rem 0; }
+
+audio.snd-player {
+    display: inline-block;
+    height: 2rem;
+    vertical-align: middle;
+    margin: 0.1rem 0.3rem;
+    max-width: 220px;
+}
+
+.snd-missing {
+    opacity: 0.4;
+    font-size: 0.9em;
+    cursor: default;
+}
 
 hr {
     border: none;
@@ -1376,10 +1597,13 @@ class MainWindow(Adw.ApplicationWindow):
         self.webview = WebKit.WebView()
         self.webview.set_vexpand(True)
         nav_policy = self.webview.get_settings()
-        nav_policy.set_enable_javascript(False)
+        # JS required for snapshot (innerHTML replace) rendering
+        nav_policy.set_enable_javascript(True)
         nav_policy.set_enable_page_cache(True)
         nav_policy.set_enable_back_forward_navigation_gestures(False)
         self.webview.connect("decide-policy", self._on_nav_policy)
+        self._webview_ready = False   # True once initial page has loaded
+        self.webview.connect("load-changed", self._on_webview_load_changed)
 
         art_toolbar.set_content(self.webview)
         right_box.append(art_toolbar)
@@ -1560,6 +1784,13 @@ class MainWindow(Adw.ApplicationWindow):
                 results = self.db.search_fulltext(query)
             else:
                 results = self.db.search_prefix(query)
+                # Fuzzy fallback: if prefix search is empty, try trigram similarity
+                if not results and len(query) >= 3:
+                    results = self.db.search_fuzzy(query)
+                    if results:
+                        # Mark fuzzy results visually via dict_name annotation
+                        for r in results:
+                            r["dict_name"] = f"~{r['dict_name']}"
 
             GLib.idle_add(self._apply_search_results, token, query, results)
             self._search_queue.task_done()
@@ -1646,8 +1877,29 @@ class MainWindow(Adw.ApplicationWindow):
             finally:
                 self._lookup_queue.task_done()
 
+    def _on_webview_load_changed(self, wv, event):
+        if event == WebKit.LoadEvent.FINISHED:
+            self._webview_ready = True
+
     def _show_html(self, html: str):
         base_uri = GLib.filename_to_uri(str(DATA_DIR), None)
+        if self._webview_ready:
+            # Snapshot render: replace body content without a full page reload.
+            # Extract the <body> content from the new HTML and swap it in via JS,
+            # preserving scroll position reset.
+            body_match = re.search(r"<body[^>]*>(.*)</body>", html, re.S)
+            if body_match:
+                body_content = body_match.group(1)
+                # JSON-encode the content so it survives JS string embedding
+                import json
+                js = (
+                    "document.body.innerHTML = " + json.dumps(body_content) + ";"
+                    "window.scrollTo(0,0);"
+                )
+                self.webview.evaluate_javascript(js, -1, None, None, None, None, None)
+                return
+        # First load or fallback: full page load
+        self._webview_ready = False
         self.webview.load_html(html, base_uri)
 
     def _on_nav_policy(self, wv, decision, decision_type):
