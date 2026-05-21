@@ -1408,10 +1408,10 @@ def _sanitize_article(html: str) -> str:
                 flags=re.I,
             )
 
-        # Ensure media tags only allow file:// or https:// sources
+        # Ensure media tags only allow safe explicit schemes or local relative paths
         if tag in ("img", "audio", "source"):
             attrs = re.sub(
-                r"""((?:src)\s*=\s*)(['"])((?!https?://|file://)[^'"]*)\2""",
+                r"""((?:src)\s*=\s*)(['"])((?!https?://|file://)[^'"]*:[^'"]*)\2""",
                 r'\1\2#\2',
                 attrs,
                 flags=re.I,
