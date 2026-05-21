@@ -17,7 +17,7 @@ Features
 """
 
 from __future__ import annotations
-
+import random
 import functools
 import gzip
 import hashlib
@@ -1651,6 +1651,13 @@ class MainWindow(Adw.ApplicationWindow):
         import_dir_btn.connect("clicked", self._on_import_dir)
         header.pack_start(import_dir_btn)
 
+        random_btn = Gtk.Button(
+            icon_name="media-playlist-shuffle-symbolic",
+            tooltip_text="Random word",
+        )
+        random_btn.connect("clicked", self._on_random_word)
+        header.pack_start(random_btn)
+        
         prefs_btn = Gtk.Button(
             icon_name="preferences-system-symbolic",
             tooltip_text="Preferences",
@@ -2205,6 +2212,64 @@ class MainWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    # -- Random word -----------------------------------------------------------
+    def _on_random_word(self, _btn):
+        def _worker():
+            try:
+                enabled = [d for d in self.db.get_dictionaries() if d["enabled"]]
+
+                if not enabled:
+                    GLib.idle_add(
+                        self._show_html,
+                        build_message_html("No enabled dictionaries.")
+                    )
+                    return
+
+                # Pick a random dictionary
+                d = random.choice(enabled)
+                conn = self.db._reader_conn(d["db_path"])
+
+                # 1. Get total count of entries (extremely fast via rowcount/indexes)
+                count_row = conn.execute("SELECT COUNT(*) FROM entries").fetchone()
+                if not count_row or count_row[0] == 0:
+                    return
+                total_entries = count_row[0]
+
+                # 2. Generate a random offset index in Python
+                random_offset = random.randint(0, total_entries - 1)
+
+                # 3. Retrieve the headword using the fast offset jump
+                row = conn.execute(
+                    "SELECT headword FROM entries LIMIT 1 OFFSET ?",
+                    (random_offset,)
+                ).fetchone()
+
+                if not row:
+                    return
+
+                headword = row["headword"]
+
+                def _apply():
+                    self.search_entry.set_text(headword)
+                    results = self.db.search_prefix(headword)
+                    self._populate_results(results)
+                    
+                    exact_idx = next(
+                        (i for i, r in enumerate(results) 
+                         if r["headword"].casefold() == headword.casefold()),
+                        0,
+                    )
+                    self._select_and_load(exact_idx)
+
+                GLib.idle_add(_apply)
+
+            except Exception as e:
+                GLib.idle_add(
+                    self._show_html,
+                    build_message_html(f"Random lookup failed: {e}")
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()    
     # ── History popup ─────────────────────────────────────────────────────────
 
     def _on_history(self, btn):
