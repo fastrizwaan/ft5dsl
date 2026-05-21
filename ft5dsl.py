@@ -289,6 +289,11 @@ def _convert_inline_no_esc(text: str) -> str:
     return text
 
 
+# NOTE:
+# The current DSL parser is still regex-based for simplicity and performance.
+# A future tokenizer/AST parser would improve handling of nested or malformed
+# DSL markup while keeping rendering and sanitization cleaner.
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Mmap & Encoding Manager
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1330,9 +1335,17 @@ _ALLOWED_TAGS = frozenset(
 )
 
 # Attributes unconditionally forbidden on any element
+# NOTE: style= is intentionally NOT globally removed because DSL [c red]...[/c]
+# generates inline color styling. We sanitize style values separately.
 _FORBIDDEN_ATTRS = re.compile(
-    r"""\s+(?:on\w+|style|formaction|action|data|srcdoc|xlink:\w+)"""
+    r"""\s+(?:on\w+|formaction|action|data|srcdoc|xlink:\w+)"""
     r"""(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*))?""",
+    re.I,
+)
+
+# Allow only a very small safe subset of inline CSS properties.
+_SAFE_STYLE_RE = re.compile(
+    r"""color\s*:\s*([#\w\s(),.%+-]+)""",
     re.I,
 )
 
@@ -1363,10 +1376,42 @@ def _sanitize_article(html: str) -> str:
         # Strip forbidden attributes
         attrs = _FORBIDDEN_ATTRS.sub("", attrs)
 
+        # Sanitize inline styles — only preserve safe "color:" declarations.
+        style_match = re.search(
+            r"""style\s*=\s*(['\"])(.*?)\1""",
+            attrs,
+            flags=re.I | re.S,
+        )
+        if style_match:
+            style_value = style_match.group(2)
+            safe_styles = _SAFE_STYLE_RE.findall(style_value)
+
+            attrs = re.sub(
+                r"""\s*style\s*=\s*(['\"]).*?\1""",
+                "",
+                attrs,
+                flags=re.I | re.S,
+            )
+
+            if safe_styles:
+                sanitized_style = "; ".join(
+                    f"color:{v.strip()}" for v in safe_styles
+                )
+                attrs += f' style="{sanitized_style}"'
+
         # Ensure <a> tags only allow safe href schemes
         if tag == "a":
             attrs = re.sub(
                 r"""(href\s*=\s*)(['"])((?!https?://|lookup:|file://)[^'"]*)\2""",
+                r'\1\2#\2',
+                attrs,
+                flags=re.I,
+            )
+
+        # Ensure media tags only allow file:// or https:// sources
+        if tag in ("img", "audio", "source"):
+            attrs = re.sub(
+                r"""((?:src)\s*=\s*)(['"])((?!https?://|file://)[^'"]*)\2""",
                 r'\1\2#\2',
                 attrs,
                 flags=re.I,
@@ -1986,6 +2031,7 @@ class MainWindow(Adw.ApplicationWindow):
         while not self._lookup_queue.empty():
             try:
                 self._lookup_queue.get_nowait()
+                self._lookup_queue.task_done()
             except queue.Empty:
                 break
         self._lookup_queue.put((headword, db_path, request_id))
